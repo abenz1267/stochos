@@ -1,7 +1,8 @@
 //! Pure computer-vision detector (always-available fallback; `image` +
 //! `imageproc` only). Pipeline: downscale → grayscale → Canny → morphological
 //! close → connected components → shape filtering/scoring → drop icon-in-hit-area
-//! nesting. Sees visual structure, not semantic clickability.
+//! nesting. A sensitive edge pass recovers faint outlined fields. Sees visual
+//! structure, not semantic clickability.
 
 use anyhow::{bail, Context};
 use image::{GrayImage, Luma};
@@ -14,7 +15,10 @@ use imageproc::{
 use std::collections::HashMap;
 
 use super::detect::{DetectorOutput, HintCandidate, HintDetector};
-use crate::{backend::Backend, config::config};
+use crate::{
+    backend::Backend,
+    config::{config, HintConfig},
+};
 
 #[derive(Default)]
 pub struct CvHintDetector;
@@ -50,6 +54,15 @@ fn detect_candidates_cv(
     capture_w: u32,
     capture_h: u32,
 ) -> anyhow::Result<Vec<HintCandidate>> {
+    detect_candidates_with_config(bgra, capture_w, capture_h, &config().hint)
+}
+
+fn detect_candidates_with_config(
+    bgra: &[u8],
+    capture_w: u32,
+    capture_h: u32,
+    cfg: &HintConfig,
+) -> anyhow::Result<Vec<HintCandidate>> {
     if capture_w == 0 || capture_h == 0 {
         bail!("cannot run hint CV detector on an empty capture");
     }
@@ -57,7 +70,6 @@ fn detect_candidates_cv(
         bail!("screen capture buffer is smaller than declared dimensions");
     }
 
-    let cfg = &config().hint;
     let longest = capture_w.max(capture_h);
     let scale = if cfg.downscale_longest > 0 && longest > cfg.downscale_longest {
         cfg.downscale_longest as f32 / longest as f32
@@ -78,7 +90,23 @@ fn detect_candidates_cv(
     const CLOSE_RADIUS: u8 = 2;
     let closed = close(&edges, Norm::LInf, CLOSE_RADIUS);
 
-    let components = connected_component_boxes(&closed);
+    // Faint input borders often have no edge strong enough to seed the normal
+    // Canny pass. Only accept field-shaped outlines from this sensitive pass,
+    // so lowering its thresholds does not label every glyph or separator.
+    let faint_edges = canny(
+        &gray,
+        cfg.edge_low_threshold as f32 / 16.0,
+        cfg.edge_high_threshold as f32 / 16.0,
+    );
+    let faint_closed = close(&faint_edges, Norm::LInf, CLOSE_RADIUS);
+    let mut components = connected_component_boxes(&closed);
+    components.extend(
+        connected_component_boxes(&faint_closed)
+            .into_iter()
+            .filter(|c| field_outline_support(&faint_closed, c.bbox).is_some())
+            .filter(|c| !components.iter().any(|existing| existing.bbox == c.bbox))
+            .collect::<Vec<_>>(),
+    );
 
     // Shape filters, relative to the working image so behaviour matches at
     // 1080p and 4K: minimum side (sub-glyph noise), maximum side/area
@@ -101,7 +129,13 @@ fn detect_candidates_cv(
             if w < MIN_SIZE || h < MIN_SIZE {
                 return None;
             }
-            if (w as f32) > max_w || (h as f32) > max_h {
+            let field_support = field_outline_support(&faint_closed, component.bbox);
+            let width_limit = if field_support.is_some() {
+                0.9 * ww as f32
+            } else {
+                max_w
+            };
+            if (w as f32) > width_limit || (h as f32) > max_h {
                 return None;
             }
             let area = (w as f32) * (h as f32);
@@ -109,12 +143,13 @@ fn detect_candidates_cv(
                 return None;
             }
             let aspect = (w.max(h) as f32) / (w.min(h).max(1) as f32);
-            if aspect > MAX_ASPECT {
+            if aspect > MAX_ASPECT && field_support.is_none() {
                 return None;
             }
             // Coherent controls fill their box; gradient/text speckle scores low.
             let solidity = (component.pixels as f32 / area).clamp(0.0, 1.0);
-            Some((component, solidity))
+            // Hollow field borders have low fill despite being coherent targets.
+            Some((component, field_support.unwrap_or(solidity)))
         })
         .collect();
 
@@ -131,6 +166,40 @@ fn detect_candidates_cv(
             }
         })
         .collect())
+}
+
+/// Evidence for an outlined, horizontal field. Require most of every side;
+/// long rules, text lines, and open shapes must not become wide input targets.
+/// Ignore a few corner pixels to allow rounded borders, and tolerate a small
+/// inset because Canny can produce edges on either side of a border.
+fn field_outline_support(mask: &GrayImage, (x, y, w, h): (u32, u32, u32, u32)) -> Option<f32> {
+    if !(8..=96).contains(&h) || w < h * 2 || w > h * 40 {
+        return None;
+    }
+    let margin = 4.min(h / 4);
+    let horizontal = |side_y: u32| {
+        (x + margin..x + w - margin)
+            .filter(|&px| {
+                (side_y.saturating_sub(2).max(y)..=(side_y + 2).min(y + h - 1))
+                    .any(|py| mask.get_pixel(px, py)[0] != 0)
+            })
+            .count() as f32
+            / (w - 2 * margin) as f32
+    };
+    let vertical = |side_x: u32| {
+        (y + margin..y + h - margin)
+            .filter(|&py| {
+                (side_x.saturating_sub(2).max(x)..=(side_x + 2).min(x + w - 1))
+                    .any(|px| mask.get_pixel(px, py)[0] != 0)
+            })
+            .count() as f32
+            / (h - 2 * margin) as f32
+    };
+    let support = horizontal(y)
+        .min(horizontal(y + h - 1))
+        .min(vertical(x))
+        .min(vertical(x + w - 1));
+    (support >= 0.7).then_some(support)
 }
 
 /// Map a working-image box back to clamped capture-pixel coordinates.
@@ -254,6 +323,75 @@ fn connected_component_boxes(mask: &GrayImage) -> Vec<Component> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn detect_gray(img: &GrayImage, cfg: &HintConfig) -> Vec<HintCandidate> {
+        let bgra: Vec<u8> = img.pixels().flat_map(|p| [p[0], p[0], p[0], 255]).collect();
+        detect_candidates_with_config(&bgra, img.width(), img.height(), cfg).unwrap()
+    }
+
+    #[test]
+    fn detects_faint_and_wide_input_outlines() {
+        // Light/dark themes, rounded corners, and a high-DPI capture. At 20:1
+        // these fields were also rejected by the generic 12:1 aspect filter.
+        for (background, border, factor, width) in [
+            (255, 235, 1, 480),
+            (30, 50, 1, 480),
+            (255, 235, 2, 480),
+            (255, 235, 1, 200),
+            (255, 0, 1, 480),
+        ] {
+            let mut img = GrayImage::from_pixel(640 * factor, 360 * factor, Luma([background]));
+            let expected = (40 * factor, 100 * factor, width * factor, 24 * factor);
+            let (x, y, w, h) = expected;
+            for py in 0..h {
+                for px in 0..w {
+                    let dx = px.min(w - 1 - px) / factor;
+                    let dy = py.min(h - 1 - py) / factor;
+                    // A one-logical-pixel outline with clipped rounded corners.
+                    if (dy == 0 && dx >= 4)
+                        || (dx == 0 && dy >= 4)
+                        || (dx + dy == 3 && dx > 0 && dy > 0)
+                    {
+                        img.put_pixel(x + px, y + py, Luma([border]));
+                    }
+                }
+            }
+            // Placeholder-like strokes must not obscure the field's border.
+            for px in (x + 12 * factor..x + 100 * factor).step_by(8 * factor as usize) {
+                for py in y + 8 * factor..y + 16 * factor {
+                    img.put_pixel(px, py, Luma([border]));
+                }
+            }
+            let cfg = HintConfig {
+                downscale_longest: 640,
+                ..HintConfig::default()
+            };
+            let candidates = detect_gray(&img, &cfg);
+            assert!(
+                candidates.iter().any(|c| {
+                    c.bbox.0.abs_diff(x) <= 4 * factor
+                        && c.bbox.1.abs_diff(y) <= 4 * factor
+                        && c.bbox.2.abs_diff(w) <= 4 * factor
+                        && c.bbox.3.abs_diff(h) <= 4 * factor
+                }),
+                "missing {expected:?} on background {background}: {candidates:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sensitive_pass_rejects_rules_and_open_outlines() {
+        let mut img = GrayImage::from_pixel(640, 360, Luma([255]));
+        for x in 40..520 {
+            img.put_pixel(x, 100, Luma([235]));
+            img.put_pixel(x, 180, Luma([235]));
+            img.put_pixel(x, 204, Luma([235]));
+        }
+        for y in 180..205 {
+            img.put_pixel(40, y, Luma([235]));
+        }
+        assert!(detect_gray(&img, &HintConfig::default()).is_empty());
+    }
 
     #[test]
     fn solidity_is_pixel_fill_ratio() {

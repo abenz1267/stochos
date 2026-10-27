@@ -31,11 +31,13 @@ impl HintDetector for CvHintDetector {
         let capture = backend.capture_screen().context(
             "hint mode requires screen capture; the CV detector cannot run on this backend",
         )?;
-        let candidates = detect_candidates_cv(&capture.bgra, capture.w, capture.h)?;
+        let candidates = detect_candidates_cv(&capture.bgra, capture.w, capture.h);
+        let (capture_w, capture_h) = (capture.w, capture.h);
+        backend.recycle_capture(capture);
         Ok(DetectorOutput {
-            candidates,
-            capture_w: capture.w,
-            capture_h: capture.h,
+            candidates: candidates?,
+            capture_w,
+            capture_h,
             focus_rect: None,
         })
     }

@@ -45,6 +45,7 @@ pub struct X11Backend {
     /// window contents are lost whenever the server clears the window, and
     /// nothing else in the app knows it needs to redraw.
     frame: Vec<u8>,
+    capture_pixels: Vec<u8>,
     /// Set after (re)mapping. Triggers one repaint once the event queue goes
     /// idle, so a compositor that started tracking damage on this window only
     /// after our first paint still ends up with the right contents.
@@ -134,6 +135,7 @@ impl X11Backend {
             mapped: true,
             xkb_state,
             frame: background.clone(),
+            capture_pixels: Vec::new(),
             background,
             settle_repaint: true,
         })
@@ -279,12 +281,24 @@ impl Backend for X11Backend {
     }
 
     fn capture_screen(&mut self) -> Result<Capture> {
-        let bgra = capture_root(&self.conn, self.root, self.screen_w, self.screen_h)?;
+        // The mapped overlay freezes the desktop into `background`. Capturing
+        // the root here would include our own labels when re-entering hint mode.
+        if self.mapped {
+            self.capture_pixels.clone_from(&self.background);
+        } else {
+            self.capture_pixels =
+                capture_root(&self.conn, self.root, self.screen_w, self.screen_h)?;
+        }
+        let bgra = std::mem::take(&mut self.capture_pixels);
         Ok(Capture {
             bgra,
             w: self.screen_w,
             h: self.screen_h,
         })
+    }
+
+    fn recycle_capture(&mut self, capture: Capture) {
+        self.capture_pixels = capture.bgra;
     }
 
     fn move_mouse(&mut self, x: u32, y: u32) -> Result<()> {
@@ -455,7 +469,19 @@ impl Backend for X11Backend {
             return Ok(());
         }
         // Re-capture desktop since it may have changed after our action.
+        let geometry = self.conn.get_geometry(self.root)?.reply()?;
+        self.screen_w = u32::from(geometry.width);
+        self.screen_h = u32::from(geometry.height);
+        self.conn.configure_window(
+            self.window,
+            &ConfigureWindowAux::new()
+                .width(self.screen_w)
+                .height(self.screen_h),
+        )?;
         self.background = capture_root(&self.conn, self.root, self.screen_w, self.screen_h)?;
+        self.frame.clone_from(&self.background);
+        // Discard key events left over from the preceding activation.
+        while self.conn.poll_for_event()?.is_some() {}
         self.conn.map_window(self.window).context("remap window")?;
         self.conn
             .configure_window(

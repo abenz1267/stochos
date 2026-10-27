@@ -47,6 +47,10 @@ pub struct WaylandBackend {
     state: WaylandState,
     eq: EventQueue<WaylandState>,
     qh: QueueHandle<WaylandState>,
+    capture_buffer: Option<ShmBuffer>,
+    capture_data: Vec<u8>,
+    capture_pixels: Vec<u8>,
+    empty_pixels: Vec<u8>,
 }
 
 impl WaylandBackend {
@@ -79,6 +83,8 @@ impl WaylandBackend {
             held: None,
             pointer_pos: None,
             screencopy: None,
+            render_buffers: Vec::new(),
+            overlay_clear: false,
         };
 
         eq.roundtrip(&mut state).context("initial roundtrip")?;
@@ -92,7 +98,15 @@ impl WaylandBackend {
                 .context("waiting for configure")?;
         }
 
-        let mut backend = WaylandBackend { state, eq, qh };
+        let mut backend = WaylandBackend {
+            state,
+            eq,
+            qh,
+            capture_buffer: None,
+            capture_data: Vec::new(),
+            capture_pixels: Vec::new(),
+            empty_pixels: Vec::new(),
+        };
         backend.present_empty()?;
         Ok(backend)
     }
@@ -155,8 +169,13 @@ impl WaylandBackend {
 
     fn present_empty(&mut self) -> Result<()> {
         let (width, height) = (self.state.screen_w, self.state.screen_h);
-        let pixels = vec![0u8; (width * height * 4) as usize];
-        self.present(&pixels, width, height)?;
+        if self.state.overlay_clear {
+            return Ok(());
+        }
+        self.empty_pixels.resize((width * height * 4) as usize, 0);
+        self.state
+            .present(&self.empty_pixels, width, height, &self.qh)?;
+        self.state.overlay_clear = true;
         self.eq
             .roundtrip(&mut self.state)
             .context("roundtrip after initial present")?;
@@ -171,7 +190,7 @@ impl Backend for WaylandBackend {
 
     fn present(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<()> {
         self.state.present(pixels, width, height, &self.qh)?;
-        Ok(())
+        self.state.conn.flush().context("flush overlay frame")
     }
 
     fn mouse_pos(&mut self) -> Result<(u32, u32)> {
@@ -227,22 +246,19 @@ impl Backend for WaylandBackend {
                 format!("screencopy offered no supported wl_shm format (got {offered:?})")
             })?;
         let size = params.stride as usize * params.height as usize;
-        let mut file = tempfile::tempfile().context("create screencopy shm tempfile")?;
-        file.set_len(size as u64)
-            .context("resize screencopy shm tempfile")?;
-
-        let shm = self.state.shm.as_ref().context("wl_shm not available")?;
-        let pool = shm.create_pool(file.as_fd(), size as i32, &self.qh, ());
-        let buffer = pool.create_buffer(
-            0,
-            params.width as i32,
-            params.height as i32,
-            params.stride as i32,
-            params.format,
-            &self.qh,
-            (),
-        );
-        frame.copy(&buffer);
+        if self
+            .capture_buffer
+            .as_ref()
+            .is_none_or(|b| b.params != params)
+        {
+            self.capture_buffer = Some(ShmBuffer::new(
+                self.state.shm.as_ref().context("wl_shm not available")?,
+                &self.qh,
+                params,
+                BufferTag::Capture,
+            )?);
+        }
+        frame.copy(&self.capture_buffer.as_ref().unwrap().buffer);
         self.state
             .conn
             .flush()
@@ -263,20 +279,30 @@ impl Backend for WaylandBackend {
             .context("screencopy finished without a result")?;
         let capture_flags = capture.flags;
         frame.destroy();
-        buffer.destroy();
-        pool.destroy();
+
         if let ScreencopyDone::Failed = done {
             bail!("screencopy frame failed");
         }
 
+        let file = &mut self.capture_buffer.as_mut().unwrap().file;
         file.seek(SeekFrom::Start(0))
             .context("rewind screencopy shm file")?;
-        let mut data = vec![0u8; size];
-        file.read_exact(&mut data)
+        self.capture_data.resize(size, 0);
+        file.read_exact(&mut self.capture_data)
             .context("read screencopy shm buffer")?;
-        let bgra = convert_screencopy_buffer(&data, params, capture_flags)?;
+        convert_screencopy_buffer(
+            &self.capture_data,
+            params,
+            capture_flags,
+            &mut self.capture_pixels,
+        )?;
+        let bgra = std::mem::take(&mut self.capture_pixels);
         let (w, h) = (params.width, params.height);
         Ok(Capture { bgra, w, h })
+    }
+
+    fn recycle_capture(&mut self, capture: Capture) {
+        self.capture_pixels = capture.bgra;
     }
 
     fn move_mouse(&mut self, x: u32, y: u32) -> Result<()> {
@@ -588,9 +614,63 @@ struct WaylandState {
     held: Option<HeldKey>,
     pointer_pos: Option<(u32, u32)>,
     screencopy: Option<ScreencopyState>,
+    render_buffers: Vec<ShmBuffer>,
+    overlay_clear: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
+enum BufferTag {
+    Render(usize),
+    Capture,
+}
+
+struct ShmBuffer {
+    file: std::fs::File,
+    pool: wl_shm_pool::WlShmPool,
+    buffer: wl_buffer::WlBuffer,
+    params: ScreencopyBufferParams,
+    busy: bool,
+}
+
+impl ShmBuffer {
+    fn new(
+        shm: &wl_shm::WlShm,
+        qh: &QueueHandle<WaylandState>,
+        params: ScreencopyBufferParams,
+        tag: BufferTag,
+    ) -> Result<Self> {
+        let file = tempfile::tempfile().context("create shared pixel buffer")?;
+        let size = u64::from(params.stride) * u64::from(params.height);
+        let pool_size = i32::try_from(size).context("shared pixel buffer too large")?;
+        file.set_len(size).context("size shared pixel buffer")?;
+        let pool = shm.create_pool(file.as_fd(), pool_size, qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            params.width as i32,
+            params.height as i32,
+            params.stride as i32,
+            params.format,
+            qh,
+            tag,
+        );
+        Ok(Self {
+            file,
+            pool,
+            buffer,
+            params,
+            busy: false,
+        })
+    }
+}
+
+impl Drop for ShmBuffer {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+        self.pool.destroy();
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct ScreencopyBufferParams {
     format: wl_shm::Format,
     width: u32,
@@ -667,31 +747,43 @@ impl WaylandState {
         height: u32,
         qh: &QueueHandle<Self>,
     ) -> Result<()> {
-        let stride = width * 4;
-        let mut file = tempfile::tempfile().context("create shm tempfile")?;
-        file.write_all(pixels).context("write pixel buffer")?;
-
+        let params = ScreencopyBufferParams {
+            width,
+            height,
+            stride: width * 4,
+            format: wl_shm::Format::Argb8888,
+        };
+        let slot = self
+            .render_buffers
+            .iter()
+            .position(|b| !b.busy)
+            .unwrap_or(self.render_buffers.len());
         let shm = self.shm.as_ref().context("wl_shm not available")?;
-        let pool = shm.create_pool(file.as_fd(), pixels.len() as i32, qh, ());
-        let buf = pool.create_buffer(
-            0,
-            width as i32,
-            height as i32,
-            stride as i32,
-            wl_shm::Format::Argb8888,
-            qh,
-            (),
-        );
-
+        if slot == self.render_buffers.len() {
+            self.render_buffers
+                .push(ShmBuffer::new(shm, qh, params, BufferTag::Render(slot))?);
+        } else if self.render_buffers[slot].params != params {
+            self.render_buffers[slot] = ShmBuffer::new(shm, qh, params, BufferTag::Render(slot))?;
+        }
+        let target = &mut self.render_buffers[slot];
+        target.file.rewind().context("rewind overlay buffer")?;
+        target
+            .file
+            .write_all(pixels)
+            .context("write overlay buffer")?;
+        target.busy = true;
         let surface = self.surface.as_ref().context("wl_surface not available")?;
-        surface.attach(Some(&buf), 0, 0);
+        surface.attach(Some(&target.buffer), 0, 0);
         surface.damage_buffer(0, 0, width as i32, height as i32);
         surface.commit();
-        pool.destroy();
+        self.overlay_clear = false;
         Ok(())
     }
 
     fn init_layer_surface(&mut self, qh: &QueueHandle<Self>) {
+        self.overlay_clear = false;
+        self.pending_key = None;
+        self.held = None;
         let compositor = self.compositor.as_ref().expect("wl_compositor missing");
         let layer_shell = self
             .layer_shell
@@ -952,7 +1044,22 @@ delegate_noop!(WaylandState: ignore wl_region::WlRegion);
 delegate_noop!(WaylandState: ignore wl_output::WlOutput);
 delegate_noop!(WaylandState: ignore wl_shm::WlShm);
 delegate_noop!(WaylandState: ignore wl_shm_pool::WlShmPool);
-delegate_noop!(WaylandState: ignore wl_buffer::WlBuffer);
+impl Dispatch<wl_buffer::WlBuffer, BufferTag> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &wl_buffer::WlBuffer,
+        event: wl_buffer::Event,
+        tag: &BufferTag,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let (wl_buffer::Event::Release, BufferTag::Render(slot)) = (event, tag) {
+            if let Some(buffer) = state.render_buffers.get_mut(*slot) {
+                buffer.busy = false;
+            }
+        }
+    }
+}
 impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
     fn event(
         state: &mut Self,
@@ -1087,7 +1194,8 @@ fn convert_screencopy_buffer(
     data: &[u8],
     params: ScreencopyBufferParams,
     flags: u32,
-) -> Result<Vec<u8>> {
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let width = params.width as usize;
     let height = params.height as usize;
     let stride = params.stride as usize;
@@ -1107,7 +1215,7 @@ fn convert_screencopy_buffer(
         other => bail!("unsupported screencopy wl_shm format: {other:?}"),
     };
 
-    let mut out = vec![0u8; row_bytes * height];
+    out.resize(row_bytes * height, 0);
     for y in 0..height {
         let dst_y = if flags & SCREENCOPY_Y_INVERT != 0 {
             height - 1 - y
@@ -1137,5 +1245,49 @@ fn convert_screencopy_buffer(
             }
         }
     }
-    Ok(out)
+    Ok(())
+}
+
+#[cfg(test)]
+mod buffer_tests {
+    use super::*;
+
+    #[test]
+    fn conversion_reuses_storage_and_handles_stride_formats_and_flip() {
+        let data = [
+            1, 2, 3, 4, 5, 6, 7, 8, 99, 99, 99, 99, 9, 10, 11, 12, 13, 14, 15, 16, 99, 99, 99, 99,
+        ];
+        let mut out = vec![0; 16];
+        let storage = out.as_ptr();
+        for format in [
+            wl_shm::Format::Argb8888,
+            wl_shm::Format::Xrgb8888,
+            wl_shm::Format::Abgr8888,
+            wl_shm::Format::Xbgr8888,
+        ] {
+            for flags in [0, SCREENCOPY_Y_INVERT] {
+                let params = ScreencopyBufferParams {
+                    format,
+                    width: 2,
+                    height: 2,
+                    stride: 12,
+                };
+                convert_screencopy_buffer(&data, params, flags, &mut out).unwrap();
+                assert_eq!(out.as_ptr(), storage);
+                let mut expected = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+                if flags != 0 {
+                    expected.rotate_left(8);
+                }
+                for px in expected.as_chunks_mut::<4>().0 {
+                    if matches!(format, wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888) {
+                        px.swap(0, 2);
+                    }
+                    if matches!(format, wl_shm::Format::Xrgb8888 | wl_shm::Format::Xbgr8888) {
+                        px[3] = 255;
+                    }
+                }
+                assert_eq!(out, expected);
+            }
+        }
+    }
 }

@@ -53,6 +53,9 @@ pub trait Backend {
         anyhow::bail!("screen capture is not implemented for this backend")
     }
 
+    /// Return owned capture storage for reuse on the next detection.
+    fn recycle_capture(&mut self, _capture: Capture) {}
+
     /// Move the mouse pointer to an absolute position.
     fn move_mouse(&mut self, x: u32, y: u32) -> Result<()>;
 

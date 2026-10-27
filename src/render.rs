@@ -302,7 +302,12 @@ pub fn render_hints(buf: &mut [u8], w: u32, h: u32, elements: &[HintElement], ty
     // sorted by importance, so the most important targets keep their natural spot
     // and overlapping neighbours (e.g. a browser tab and its close button) are
     // nudged to the nearest free position instead of stacking unreadably.
-    let placements = place_chips(elements, w, h, chip_h, cw);
+    let placements = HINT_LAYOUT.with(|cache| {
+        cache
+            .borrow_mut()
+            .placements(elements, w, h, chip_h, cw)
+            .to_vec()
+    });
 
     // Layered draw: dimmed (non-matching) chips first, then the matching ones on
     // top, so a label you can still type is never hidden under a dimmed
@@ -336,6 +341,44 @@ pub fn render_hints(buf: &mut [u8], w: u32, h: u32, elements: &[HintElement], ty
                 draw_crosshair(&mut c, colors, el.cx, el.cy);
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct HintLayout {
+    dimensions: (u32, u32, u32, u32),
+    targets: Vec<((u32, u32, u32, u32), usize)>,
+    placed: Vec<(u32, u32, u32)>,
+}
+
+thread_local! {
+    static HINT_LAYOUT: std::cell::RefCell<HintLayout> = std::cell::RefCell::default();
+}
+
+impl HintLayout {
+    fn placements(
+        &mut self,
+        elements: &[HintElement],
+        w: u32,
+        h: u32,
+        chip_h: u32,
+        cw: u32,
+    ) -> &[(u32, u32, u32)] {
+        let dimensions = (w, h, chip_h, cw);
+        let unchanged =
+            self.dimensions == dimensions
+                && self.targets.len() == elements.len()
+                && self.targets.iter().zip(elements).all(|(cached, element)| {
+                    *cached == (element.bbox, element.label.chars().count())
+                });
+        if !unchanged {
+            self.placed = place_chips(elements, w, h, chip_h, cw);
+            self.targets.clear();
+            self.targets
+                .extend(elements.iter().map(|e| (e.bbox, e.label.chars().count())));
+            self.dimensions = dimensions;
+        }
+        &self.placed
     }
 }
 
@@ -798,6 +841,25 @@ fn render_sub_grid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hint_layout_updates_when_targets_or_dimensions_change() {
+        let mut layout = HintLayout::default();
+        let mut elements = vec![HintElement {
+            cx: 20,
+            cy: 20,
+            bbox: (10, 10, 20, 20),
+            label: "a".into(),
+        }];
+        let first = layout.placements(&elements, 640, 360, 14, 8).to_vec();
+        assert_eq!(first, layout.placements(&elements, 640, 360, 14, 8));
+        elements[0].bbox.0 = 200;
+        assert_ne!(first, layout.placements(&elements, 640, 360, 14, 8));
+        elements[0].label = "ab".into();
+        assert_eq!(layout.placements(&elements, 640, 360, 14, 8)[0].2, 24);
+        let changed = layout.placements(&elements, 640, 360, 14, 8).to_vec();
+        assert_ne!(changed, layout.placements(&elements, 160, 360, 14, 8));
+    }
 
     #[test]
     fn coincident_elements_get_non_overlapping_chips() {

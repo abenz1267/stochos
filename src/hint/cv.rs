@@ -28,10 +28,14 @@ impl HintDetector for CvHintDetector {
     }
 
     fn detect(&self, backend: &mut dyn Backend) -> anyhow::Result<DetectorOutput> {
+        let capture_timer = crate::timing::Span::new("capture");
         let capture = backend.capture_screen().context(
             "hint mode requires screen capture; the CV detector cannot run on this backend",
         )?;
+        drop(capture_timer);
+        let cv_timer = crate::timing::Span::new("cv");
         let candidates = detect_candidates_cv(&capture.bgra, capture.w, capture.h);
+        drop(cv_timer);
         let (capture_w, capture_h) = (capture.w, capture.h);
         backend.recycle_capture(capture);
         Ok(DetectorOutput {

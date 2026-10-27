@@ -309,7 +309,7 @@ static EVENT_QUEUE: Mutex<VecDeque<KeyEvent>> = Mutex::new(VecDeque::new());
 static EVENT_TAP: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 impl MacosBackend {
-    pub fn new() -> Result<Self> {
+    pub fn new(start_hidden: bool) -> Result<Self> {
         let mtm = MainThreadMarker::new()
             .ok_or_else(|| anyhow!("MacosBackend must be constructed on the main thread"))?;
 
@@ -382,7 +382,9 @@ impl MacosBackend {
         // `orderFrontRegardless` shows the panel without firing the
         // active-app / key-window / main-window notifications that
         // trigger menu auto-dismiss.
-        window.orderFrontRegardless();
+        if !start_hidden {
+            window.orderFrontRegardless();
+        }
 
         let event_source = unsafe { CGEventSourceCreate(K_CGEVENT_SOURCE_STATE_HIDSYSTEM_STATE) };
         if event_source.is_null() {
@@ -417,7 +419,7 @@ impl MacosBackend {
             EVENT_TAP.store(tap, Ordering::Release);
             unsafe {
                 CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
-                CGEventTapEnable(tap, true);
+                CGEventTapEnable(tap, !start_hidden);
             }
             EventTapHandle { tap, source }
         };
@@ -428,7 +430,7 @@ impl MacosBackend {
             view,
             screen_w,
             screen_h,
-            visible: true,
+            visible: !start_hidden,
             current_image: None,
             event_source: CGEventSourceHandle(event_source),
             event_tap,
@@ -491,6 +493,7 @@ impl MacosBackend {
         if self.visible {
             return;
         }
+        EVENT_QUEUE.lock().unwrap().clear();
         self.window.orderFrontRegardless();
         unsafe { CGEventTapEnable(self.event_tap.tap, true) };
         self.pump_events_briefly();
@@ -839,6 +842,9 @@ impl Backend for MacosBackend {
         }
 
         loop {
+            if crate::daemon::shutdown_requested() {
+                return Ok(None);
+            }
             if let Some(ev) = EVENT_QUEUE.lock().unwrap().pop_front() {
                 return Ok(Some(ev));
             }
@@ -846,7 +852,11 @@ impl Backend for MacosBackend {
             // separate, so drain it explicitly for window redraws.
             self.pump_events_briefly();
             unsafe {
-                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, true);
+                CFRunLoopRunInMode(
+                    kCFRunLoopDefaultMode,
+                    if crate::daemon::running() { 0.1 } else { 0.5 },
+                    true,
+                );
             }
         }
     }

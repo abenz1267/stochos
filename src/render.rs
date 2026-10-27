@@ -279,6 +279,7 @@ pub fn render_free(buf: &mut [u8], w: u32, h: u32, x: u32, y: u32, speed: u32) {
 }
 
 pub fn render_hints(buf: &mut [u8], w: u32, h: u32, elements: &[HintElement], typed: &[char]) {
+    let _timer = crate::timing::Span::new("hint-render");
     let cfg = config();
     let colors = &cfg.colors;
     let scale = cfg.hint_font_size();

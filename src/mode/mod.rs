@@ -258,10 +258,23 @@ pub(super) fn replay_macro(
 ) -> anyhow::Result<()> {
     let speed = config().macro_playback_speed();
     for action in actions {
+        if crate::daemon::shutdown_requested() {
+            return Ok(());
+        }
         if speed > 0.0 && action.wait_ms > 0 {
             let scaled = (action.wait_ms as f32 / speed).round() as u64;
             if scaled > 0 {
-                std::thread::sleep(Duration::from_millis(scaled));
+                let deadline = Instant::now() + Duration::from_millis(scaled);
+                while Instant::now() < deadline {
+                    if crate::daemon::shutdown_requested() {
+                        return Ok(());
+                    }
+                    std::thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(50)),
+                    );
+                }
             }
         }
         match &action.kind {

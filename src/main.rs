@@ -2,11 +2,13 @@ mod app;
 mod backend;
 mod cli;
 mod config;
+mod daemon;
 mod hint;
 mod input;
 mod macro_store;
 mod mode;
 mod render;
+mod timing;
 
 use clap::Parser;
 use nix::fcntl::{Flock, FlockArg};
@@ -52,6 +54,11 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    timing::enable(args.timings || std::env::var_os("STOCHOS_TIMINGS").is_some_and(|v| v != "0"));
+    if daemon::route(&args)? {
+        return Ok(());
+    }
+    let startup = timing::Span::new("startup");
     let _lock = acquire_lock(args.allow_multiple)?; // keep lock alive
 
     config::init();
@@ -60,21 +67,36 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(all(feature = "wayland", target_os = "linux"))]
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        if let Ok(mut b) = backend::wayland::WaylandBackend::new() {
-            return app::run(&mut b, initial);
+        if let Ok(mut b) = backend::wayland::WaylandBackend::new(args.daemon) {
+            drop(startup);
+            return if args.daemon {
+                daemon::serve(&mut b)
+            } else {
+                app::run(&mut b, initial)
+            };
         }
     }
 
     #[cfg(all(feature = "x11", target_os = "linux"))]
     if std::env::var_os("DISPLAY").is_some() {
-        let mut b = backend::x11::X11Backend::new()?;
-        return app::run(&mut b, initial);
+        let mut b = backend::x11::X11Backend::new(args.daemon)?;
+        drop(startup);
+        return if args.daemon {
+            daemon::serve(&mut b)
+        } else {
+            app::run(&mut b, initial)
+        };
     }
 
     #[cfg(target_os = "macos")]
     {
-        let mut b = backend::macos::MacosBackend::new()?;
-        return app::run(&mut b, initial);
+        let mut b = backend::macos::MacosBackend::new(args.daemon)?;
+        drop(startup);
+        return if args.daemon {
+            daemon::serve(&mut b)
+        } else {
+            app::run(&mut b, initial)
+        };
     }
 
     #[cfg(not(target_os = "macos"))]

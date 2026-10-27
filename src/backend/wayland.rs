@@ -54,7 +54,7 @@ pub struct WaylandBackend {
 }
 
 impl WaylandBackend {
-    pub fn new() -> Result<Self> {
+    pub fn new(start_hidden: bool) -> Result<Self> {
         let conn = Connection::connect_to_env().context("connect to Wayland display")?;
         let mut eq = conn.new_event_queue();
         let qh = eq.handle();
@@ -89,15 +89,25 @@ impl WaylandBackend {
 
         eq.roundtrip(&mut state).context("initial roundtrip")?;
 
-        state.init_layer_surface(&qh);
-        eq.roundtrip(&mut state)
-            .context("roundtrip after layer surface")?;
+        state
+            .compositor
+            .as_ref()
+            .context("wl_compositor not available")?;
+        state.shm.as_ref().context("wl_shm not available")?;
+        state
+            .layer_shell
+            .as_ref()
+            .context("zwlr_layer_shell_v1 not available")?;
+        if !start_hidden {
+            state.init_layer_surface(&qh);
+            eq.roundtrip(&mut state)
+                .context("roundtrip after layer surface")?;
 
-        while !state.configured {
-            eq.blocking_dispatch(&mut state)
-                .context("waiting for configure")?;
+            while !state.configured {
+                eq.blocking_dispatch(&mut state)
+                    .context("waiting for configure")?;
+            }
         }
-
         let mut backend = WaylandBackend {
             state,
             eq,
@@ -107,7 +117,9 @@ impl WaylandBackend {
             capture_pixels: Vec::new(),
             empty_pixels: Vec::new(),
         };
-        backend.present_empty()?;
+        if !start_hidden {
+            backend.present_empty()?;
+        }
         Ok(backend)
     }
 
@@ -519,6 +531,9 @@ impl Backend for WaylandBackend {
 
     fn next_key(&mut self) -> Result<Option<KeyEvent>> {
         loop {
+            if crate::daemon::shutdown_requested() {
+                return Ok(None);
+            }
             if let Some(key) = self.state.pending_key.take() {
                 self.ensure_vp();
                 return Ok(Some(key));
@@ -568,7 +583,7 @@ impl WaylandBackend {
             return Ok(());
         };
 
-        let timeout = match self.state.time_to_next_repeat() {
+        let mut timeout = match self.state.time_to_next_repeat() {
             None => PollTimeout::NONE,
             Some(d) => {
                 let ms = d.as_millis().min(u16::MAX as u128) as u16;
@@ -576,6 +591,11 @@ impl WaylandBackend {
             }
         };
 
+        if crate::daemon::running()
+            && (timeout == PollTimeout::NONE || timeout > PollTimeout::from(100u16))
+        {
+            timeout = PollTimeout::from(100u16);
+        }
         let fd = guard.connection_fd();
         let mut pfds = [PollFd::new(fd, PollFlags::POLLIN)];
         let ready = poll(&mut pfds, timeout).context("poll wayland fd")?;

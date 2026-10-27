@@ -62,6 +62,7 @@ pub fn build_hint_mode_with_detector<B: Backend>(
         screen_w,
         screen_h,
     );
+    let _timer = crate::timing::Span::new("ranking-and-labels");
     Ok(assign_hint_elements(candidates, screen_w, screen_h))
 }
 
@@ -272,6 +273,14 @@ fn labels_of_len(alphabet: &[char], len: usize) -> impl Iterator<Item = String> 
         }
         chars.into_iter().collect()
     })
+}
+
+/// Start accessibility connection setup off the activation path in daemon mode.
+pub fn warm_up() {
+    #[cfg(target_os = "linux")]
+    if !matches!(config().hint.detector, crate::config::HintDetectorKind::Cv) {
+        atspi::warm_up();
+    }
 }
 
 #[cfg(test)]

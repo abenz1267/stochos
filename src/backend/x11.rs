@@ -53,7 +53,7 @@ pub struct X11Backend {
 }
 
 impl X11Backend {
-    pub fn new() -> Result<Self> {
+    pub fn new(start_hidden: bool) -> Result<Self> {
         let (conn, screen_num) = RustConnection::connect(None).context("connect to X11 display")?;
 
         // Verify XTest extension is available
@@ -69,7 +69,11 @@ impl X11Backend {
         let depth = screen.root_depth;
 
         // Capture the desktop before we cover it with the overlay.
-        let background = capture_root(&conn, root, screen_w, screen_h)?;
+        let background = if start_hidden {
+            Vec::new()
+        } else {
+            capture_root(&conn, root, screen_w, screen_h)?
+        };
 
         let window = conn.generate_id()?;
         let gc = conn.generate_id()?;
@@ -95,33 +99,34 @@ impl X11Backend {
         conn.create_gc(gc, window, &CreateGCAux::new())
             .context("create GC")?;
 
-        // Map the window and grab keyboard
-        conn.map_window(window).context("map window")?;
+        if !start_hidden {
+            // Map the window and grab keyboard
+            conn.map_window(window).context("map window")?;
 
-        // Raise above everything
-        conn.configure_window(
-            window,
-            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-        )?;
+            // Raise above everything
+            conn.configure_window(
+                window,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
 
-        // Round-trip so the server has actually processed the map before we
-        // paint. Under a compositor the map is what makes the window visible
-        // to it; painting ahead of that means our contents land before it can
-        // watch the window for damage, and it has no reason to ever pick them
-        // up (screen stays at the black background_pixel until something else
-        // redraws).
-        conn.sync().context("sync after map")?;
+            // Round-trip so the server has actually processed the map before we
+            // paint. Under a compositor the map is what makes the window visible
+            // to it; painting ahead of that means our contents land before it can
+            // watch the window for damage, and it has no reason to ever pick them
+            // up (screen stays at the black background_pixel until something else
+            // redraws).
+            conn.sync().context("sync after map")?;
 
-        // Paint the captured desktop onto the window immediately so the user
-        // never sees the black background_pixel during grab retries.
-        put_pixels(&conn, window, gc, screen_w, screen_h, depth, &background)?;
-        conn.flush().context("flush after initial paint")?;
+            // Paint the captured desktop onto the window immediately so the user
+            // never sees the black background_pixel during grab retries.
+            put_pixels(&conn, window, gc, screen_w, screen_h, depth, &background)?;
+            conn.flush().context("flush after initial paint")?;
 
-        // Grab keyboard so all keys go to our overlay.
-        // Retry briefly: on GNOME the compositor may still hold the grab when
-        // we first try (e.g. from the shortcut key-release event).
-        grab_keyboard_with_retry(&conn, window).context("grab keyboard")?;
-
+            // Grab keyboard so all keys go to our overlay.
+            // Retry briefly: on GNOME the compositor may still hold the grab when
+            // we first try (e.g. from the shortcut key-release event).
+            grab_keyboard_with_retry(&conn, window).context("grab keyboard")?;
+        }
         let xkb_state = load_xkb_state(&conn, root);
 
         Ok(X11Backend {
@@ -132,7 +137,7 @@ impl X11Backend {
             screen_w,
             screen_h,
             depth,
-            mapped: true,
+            mapped: !start_hidden,
             xkb_state,
             frame: background.clone(),
             capture_pixels: Vec::new(),
@@ -412,6 +417,9 @@ impl Backend for X11Backend {
         }
 
         loop {
+            if crate::daemon::shutdown_requested() {
+                return Ok(None);
+            }
             let event = match self.conn.poll_for_event().context("poll for event")? {
                 Some(event) => event,
                 // Nothing pending. If we just mapped, give the server a moment
@@ -423,6 +431,10 @@ impl Backend for X11Backend {
                         self.settle_repaint = false;
                         self.repaint()?;
                     }
+                    continue;
+                }
+                None if crate::daemon::running() => {
+                    self.wait_readable(100)?;
                     continue;
                 }
                 None => self.conn.wait_for_event().context("wait for event")?,

@@ -6,7 +6,7 @@ Keyboard-driven mouse control overlay for Wayland, X11, and macOS. OSS alternati
 
 ![example](example.gif)
 
-Displays a letter grid over your screen. Type a two-key combo to jump to a cell, refine with a sub-grid key, then act. Runs once per invocation (no daemon).
+Displays a letter grid over your screen. Type a two-key combo to jump to a cell, refine with a sub-grid key, then act. Runs once per invocation, or through an optional persistent daemon for faster activation.
 
 **Wayland:** Tested on **Hyprland**. Should work on any wlroots-based compositor with `zwlr_layer_shell_v1` and `zwlr_virtual_pointer_v1`.
 
@@ -78,6 +78,36 @@ Released binaries are not codesigned with a Developer ID, so after every upgrade
 3. Type one more letter to refine within the sub-grid
 4. Perform an action (see below)
 
+### Persistent daemon and timings
+
+Start the daemon once when your desktop session starts:
+
+```sh
+stochos --daemon &
+```
+
+`--daemon` runs in the foreground so a compositor startup command or service manager can supervise it. Existing shortcuts keep working: `stochos`, `stochos --hint`, `stochos --bisect`, `stochos --free`, and `stochos --free-center` automatically send an activation request to the resident process. If no daemon is running, they retain the one-shot behavior.
+
+```sh
+stochos --daemon-status    # running idle / running active
+stochos --stop-daemon      # also closes an active overlay
+```
+
+The daemon retains display and accessibility connections, capture/render buffers, and macros. While idle it hides the overlay and releases keyboard control. Requests received during an active overlay are ignored; they do not queue another overlay. SIGINT and SIGTERM also stop it and release the overlay. Restart the daemon after changing configuration or editing macros outside stochos. `--no-daemon` bypasses activation routing; the usual single-instance lock still applies (`--allow-multiple` bypasses both routing and the lock).
+
+For Hyprland, add `exec-once = stochos --daemon` alongside your existing binding. With i3, use `exec --no-startup-id stochos --daemon` in your session configuration.
+
+Measure startup, capture, CV, accessibility, ranking, and first-frame submission with:
+
+```sh
+stochos --no-daemon --hint --timings  # one-shot, with the daemon stopped
+stochos --daemon --timings           # log timings for every daemon activation
+# Or enable timings for one request to an existing daemon:
+stochos --hint --timings
+```
+
+`STOCHOS_TIMINGS=1` also enables timing output. Daemon timings go to its stderr. `activation-to-first-submit` measures session setup through submission of the first overlay frame; `startup` (one-shot) or `overlay-reopen` (daemon) is reported separately. Rendering/presentation and detection timings are nested within that session measurement; AT-SPI and CV overlap in `auto` mode. These numbers do not include the compositor's final presentation delay.
+
 ### Default keys
 
 | Key | Action |
@@ -136,8 +166,8 @@ An alternative mode that labels likely clickable UI targets directly, instead of
 Detection is pluggable behind a `HintDetector` trait, selected by `hint.detector`:
 
 - **`atspi`** (Linux, built in): reads the desktop [AT-SPI](https://docs.rs/atspi) accessibility tree over D-Bus and labels interactive elements using their roles and bounds. It is usually the most accurate detector. GTK, Qt, and Gecko apps tend to work well; Chromium/Electron may need accessibility enabled; games and canvas-heavy apps may expose little or nothing. On Wayland, exact placement requires compositor support; Hyprland and Sway are supported. On X11, coordinates are already absolute. Only the primary monitor is handled.
-- **`cv`** (always available): a pure-Rust computer-vision pass over a screenshot — downscale → Canny edges → morphological closing → connected components → resolution-relative size/shape filtering with a per-box quality score. A more sensitive pass recovers faint outlined fields; wide inputs are retained when all four border edges are present. No model, no network, no services to talk to. CV sees visual *structure*, not semantic clickability, so it will still occasionally label a border, separator, or decorative shape, and miss a low-contrast control. Tune `edge_low_threshold`/`edge_high_threshold` (raise to cut clutter, lower to catch faint controls).
-- **`auto`** (default): tries AT-SPI first and falls back to CV when needed. If an app exposes window chrome but not content, CV labels the unhandled content area.
+- **`cv`** (always available): a pure-Rust computer-vision pass over a screenshot — downscale → Canny edges → morphological closing → connected components → resolution-relative size/shape filtering with a per-box quality score. A sensitive pass recovers faint fields and compact icons; wide inputs are retained when all four border edges are present. Both edge passes share preprocessing, and binary morphology and region bounds use specialized scans. No model, no network, no services to talk to. CV sees visual *structure*, not semantic clickability, so it will still occasionally label a border, separator, or decorative shape, and miss a low-contrast control. Tune `edge_low_threshold`/`edge_high_threshold` (raise to cut clutter, lower to catch faint controls).
+- **`auto`** (default): on Linux, runs AT-SPI and CV concurrently, prefers semantic targets, and falls back to CV when needed. If an app exposes window chrome but not content, CV labels the unhandled content area.
 
 ```toml
 [hint]

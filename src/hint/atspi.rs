@@ -121,18 +121,12 @@ fn worker() -> &'static mpsc::SyncSender<Request> {
     WORKER.get_or_init(|| {
         let (tx, rx) = mpsc::sync_channel::<Request>(1);
         thread::spawn(move || {
-            let mut connection = None;
+            let mut connection = futures_executor::block_on(connect()).ok();
             while let Ok(request) = rx.recv() {
+                let _timing = crate::timing::Span::new("atspi");
                 let result = futures_executor::block_on(async {
-                    if !ACCESSIBILITY_ENABLE_REQUESTED.swap(true, Ordering::Relaxed) {
-                        let _ = atspi::connection::set_session_accessibility(true).await;
-                    }
                     if connection.is_none() {
-                        connection = Some(
-                            AccessibilityConnection::new()
-                                .await
-                                .context("connect to the AT-SPI accessibility bus")?,
-                        );
+                        connection = Some(connect().await?);
                     }
                     collect_candidates(connection.as_ref().unwrap(), request.width, request.height)
                         .await
@@ -145,6 +139,19 @@ fn worker() -> &'static mpsc::SyncSender<Request> {
         });
         tx
     })
+}
+
+async fn connect() -> Result<AccessibilityConnection> {
+    if !ACCESSIBILITY_ENABLE_REQUESTED.swap(true, Ordering::Relaxed) {
+        let _ = atspi::connection::set_session_accessibility(true).await;
+    }
+    AccessibilityConnection::new()
+        .await
+        .context("connect to the AT-SPI accessibility bus")
+}
+
+pub(super) fn warm_up() {
+    let _ = worker();
 }
 
 pub(super) struct PendingDetection {
@@ -1033,16 +1040,15 @@ mod tests {
     #[test]
     #[ignore = "requires a running AT-SPI bus and GUI apps"]
     fn walks_accessibility_tree() {
-        let start = std::time::Instant::now();
-        let (candidates, _) = collect_candidates_with_timeout(1920, 1080)
-            .expect("accessibility collection should succeed");
-        eprintln!(
-            "atspi collect: {} candidates in {:?}",
-            candidates.len(),
-            start.elapsed()
-        );
-        for c in &candidates {
-            eprintln!("  candidate bbox={:?}", c.bbox);
+        for run in 0..3 {
+            let start = std::time::Instant::now();
+            let (candidates, _) = collect_candidates_with_timeout(1920, 1080)
+                .expect("accessibility collection should succeed");
+            eprintln!(
+                "atspi collect {run}: {} candidates in {:?}",
+                candidates.len(),
+                start.elapsed()
+            );
         }
     }
 }

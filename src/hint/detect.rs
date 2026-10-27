@@ -68,9 +68,17 @@ impl HintDetector for AutoDetector {
     fn detect(&self, backend: &mut dyn Backend) -> anyhow::Result<DetectorOutput> {
         #[cfg(target_os = "linux")]
         {
-            match super::atspi::AtspiHintDetector.detect(backend) {
+            let (w, h) = backend.screen_size();
+            let semantic = super::atspi::start_detection(w, h);
+            // Keep capture on the backend's owning thread; AT-SPI's persistent
+            // worker walks the accessibility tree while we capture and run CV.
+            let visual = super::cv::CvHintDetector.detect(backend);
+            match semantic.and_then(|pending| pending.finish()) {
                 Ok(output) if output.candidates.len() >= CASCADE_MIN_ATSPI_TARGETS => {
-                    return Ok(supplement_with_cv(backend, output));
+                    return Ok(match visual {
+                        Ok(cv) => supplement_from_cv(output, cv),
+                        Err(_) => output,
+                    });
                 }
                 Ok(output) => eprintln!(
                     "hint: atspi found only {} targets, falling back to cv",
@@ -78,7 +86,7 @@ impl HintDetector for AutoDetector {
                 ),
                 Err(e) => eprintln!("hint: atspi detection failed, falling back to cv: {e:#}"),
             }
-            super::cv::CvHintDetector.detect(backend)
+            visual
         }
 
         // On macOS the AX tree is often thin (Electron/Firefox), so when the
@@ -149,11 +157,19 @@ fn scope_cv_output(
 }
 
 /// Add visual candidates that are not already covered by a precise semantic box.
-fn supplement_with_cv(backend: &mut dyn Backend, mut semantic: DetectorOutput) -> DetectorOutput {
-    let Some(window) = semantic.focus_rect else {
+#[cfg(target_os = "macos")]
+fn supplement_with_cv(backend: &mut dyn Backend, semantic: DetectorOutput) -> DetectorOutput {
+    if semantic.focus_rect.is_none() {
+        return semantic;
+    }
+    let Ok(cv) = super::cv::CvHintDetector.detect(backend) else {
         return semantic;
     };
-    let Ok(cv) = super::cv::CvHintDetector.detect(backend) else {
+    supplement_from_cv(semantic, cv)
+}
+
+fn supplement_from_cv(mut semantic: DetectorOutput, cv: DetectorOutput) -> DetectorOutput {
+    let Some(window) = semantic.focus_rect else {
         return semantic;
     };
     let cv_candidates = super::remap_to_screen(

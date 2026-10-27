@@ -11,10 +11,10 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc,
+        mpsc, OnceLock,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -109,33 +109,96 @@ struct Node {
 /// cascade uses to spot regions the accessibility tree left empty.
 type Collected = (Vec<HintCandidate>, Option<(u32, u32, u32, u32)>);
 
-fn collect_candidates_with_timeout(screen_w: u32, screen_h: u32) -> Result<Collected> {
-    let (tx, rx) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let result = futures_executor::block_on(collect_candidates(screen_w, screen_h));
-        let _ = tx.send(result);
-    });
-    match rx.recv_timeout(COLLECT_TIMEOUT) {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            anyhow::bail!("AT-SPI collection timed out after {COLLECT_TIMEOUT:?}")
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            anyhow::bail!("AT-SPI collection worker exited before sending a result")
-        }
+struct Request {
+    width: u32,
+    height: u32,
+    reply: mpsc::SyncSender<Result<Collected>>,
+}
+
+static WORKER: OnceLock<mpsc::SyncSender<Request>> = OnceLock::new();
+
+fn worker() -> &'static mpsc::SyncSender<Request> {
+    WORKER.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<Request>(1);
+        thread::spawn(move || {
+            let mut connection = None;
+            while let Ok(request) = rx.recv() {
+                let result = futures_executor::block_on(async {
+                    if !ACCESSIBILITY_ENABLE_REQUESTED.swap(true, Ordering::Relaxed) {
+                        let _ = atspi::connection::set_session_accessibility(true).await;
+                    }
+                    if connection.is_none() {
+                        connection = Some(
+                            AccessibilityConnection::new()
+                                .await
+                                .context("connect to the AT-SPI accessibility bus")?,
+                        );
+                    }
+                    collect_candidates(connection.as_ref().unwrap(), request.width, request.height)
+                        .await
+                });
+                if result.is_err() {
+                    connection = None;
+                }
+                let _ = request.reply.send(result);
+            }
+        });
+        tx
+    })
+}
+
+pub(super) struct PendingDetection {
+    reply: mpsc::Receiver<Result<Collected>>,
+    start: Instant,
+    width: u32,
+    height: u32,
+}
+
+impl PendingDetection {
+    pub(super) fn finish(self) -> Result<DetectorOutput> {
+        let (candidates, focus_rect) = self
+            .reply
+            .recv_timeout(COLLECT_TIMEOUT.saturating_sub(self.start.elapsed()))
+            .context("AT-SPI collection timed out or its worker disconnected")??;
+        Ok(DetectorOutput {
+            candidates,
+            capture_w: self.width,
+            capture_h: self.height,
+            focus_rect,
+        })
     }
 }
 
-async fn collect_candidates(screen_w: u32, screen_h: u32) -> Result<Collected> {
-    // Best-effort, once per process: ask the session to enable accessibility
-    // so toolkits publish their trees.
-    if !ACCESSIBILITY_ENABLE_REQUESTED.swap(true, Ordering::Relaxed) {
-        let _ = atspi::connection::set_session_accessibility(true).await;
-    }
+pub(super) fn start_detection(width: u32, height: u32) -> Result<PendingDetection> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let start = Instant::now();
+    // A wedged bus gets one bounded worker/queue, rather than leaking another
+    // thread on every activation. Retry a failed connection on the next job.
+    worker()
+        .try_send(Request {
+            width,
+            height,
+            reply: tx,
+        })
+        .context("AT-SPI worker is busy or unavailable")?;
+    Ok(PendingDetection {
+        reply: rx,
+        start,
+        width,
+        height,
+    })
+}
 
-    let a11y = AccessibilityConnection::new()
-        .await
-        .context("connect to the AT-SPI accessibility bus (is it running?)")?;
+fn collect_candidates_with_timeout(screen_w: u32, screen_h: u32) -> Result<Collected> {
+    let output = start_detection(screen_w, screen_h)?.finish()?;
+    Ok((output.candidates, output.focus_rect))
+}
+
+async fn collect_candidates(
+    a11y: &AccessibilityConnection,
+    screen_w: u32,
+    screen_h: u32,
+) -> Result<Collected> {
     let root = a11y
         .root_accessible_on_registry()
         .await
@@ -160,9 +223,9 @@ async fn collect_candidates(screen_w: u32, screen_h: u32) -> Result<Collected> {
     let (trees, pids) = futures_util::future::join(
         join_all(
             apps.iter()
-                .map(|(dest, root_path)| fetch_app_tree(&a11y, dest, root_path)),
+                .map(|(dest, root_path)| fetch_app_tree(a11y, dest, root_path)),
         ),
-        app_pids(&a11y, &apps, &compositor),
+        app_pids(a11y, &apps, &compositor),
     )
     .await;
 
@@ -173,12 +236,12 @@ async fn collect_candidates(screen_w: u32, screen_h: u32) -> Result<Collected> {
         // so this needs no tree completion. An app whose frames are all
         // skipped (not the active window) contributes nothing, so skip the
         // expensive lazy-child expansion entirely.
-        let offsets = frame_offsets(&a11y, dest, &nodes, pid, &compositor).await;
+        let offsets = frame_offsets(a11y, dest, &nodes, pid, &compositor).await;
         if offsets.values().all(Option::is_none) {
             continue;
         }
-        complete_tree(&a11y, dest, &mut nodes).await;
-        collect_targets(&a11y, dest, &nodes, &offsets, screen_w, screen_h, &mut out).await;
+        complete_tree(a11y, dest, &mut nodes).await;
+        collect_targets(a11y, dest, &nodes, &offsets, screen_w, screen_h, &mut out).await;
         if out.len() >= MAX_TARGETS {
             out.truncate(MAX_TARGETS);
             break;
@@ -971,7 +1034,7 @@ mod tests {
     #[ignore = "requires a running AT-SPI bus and GUI apps"]
     fn walks_accessibility_tree() {
         let start = std::time::Instant::now();
-        let (candidates, _) = futures_executor::block_on(collect_candidates(1920, 1080))
+        let (candidates, _) = collect_candidates_with_timeout(1920, 1080)
             .expect("accessibility collection should succeed");
         eprintln!(
             "atspi collect: {} candidates in {:?}",

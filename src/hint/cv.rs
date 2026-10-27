@@ -8,11 +8,10 @@ use anyhow::{bail, Context};
 use image::{GrayImage, Luma};
 use imageproc::{
     distance_transform::Norm,
-    edges::canny,
     morphology::close,
     region_labelling::{connected_components, Connectivity},
 };
-use std::collections::HashMap;
+mod edges;
 
 use super::detect::{DetectorOutput, HintCandidate, HintDetector};
 use crate::{
@@ -80,7 +79,7 @@ fn detect_candidates_with_config(
     let wh = ((capture_h as f32 * scale).round() as u32).max(1);
 
     let gray = grayscale_resized(bgra, capture_w as usize, capture_h as usize, ww, wh);
-    let edges = canny(
+    let (edges, faint_edges) = edges::canny_pair(
         &gray,
         cfg.edge_low_threshold as f32,
         cfg.edge_high_threshold as f32,
@@ -93,11 +92,6 @@ fn detect_candidates_with_config(
     // Faint input borders often have no edge strong enough to seed the normal
     // Canny pass. Restrict this sensitive pass to field outlines and small,
     // compact icons so it does not label every faint glyph or separator.
-    let faint_edges = canny(
-        &gray,
-        cfg.edge_low_threshold as f32 / 32.0,
-        cfg.edge_high_threshold as f32 / 32.0,
-    );
     // A larger radius bridges placeholder glyphs to short field borders and
     // merges fields near toolbar edges (especially after downscaling).
     let faint_closed = close(&faint_edges, Norm::LInf, 1);
@@ -359,33 +353,34 @@ fn component_boxes_with_connectivity(
     connectivity: Connectivity,
 ) -> Vec<Component> {
     let labels = connected_components(mask, connectivity, Luma([0u8]));
-    // (min_x, min_y, max_x, max_y, pixel_count)
-    let mut rects: HashMap<u32, (u32, u32, u32, u32, u32)> = HashMap::new();
-
+    // imageproc assigns dense labels starting at one. Indexing these directly
+    // avoids hashing every foreground pixel, including large empty interiors.
+    let mut rects: Vec<Component> = Vec::new();
     for (x, y, label) in labels.enumerate_pixels() {
-        let label = label[0];
+        let label = label[0] as usize;
         if label == 0 {
             continue;
         }
-        rects
-            .entry(label)
-            .and_modify(|rect| {
-                rect.0 = rect.0.min(x);
-                rect.1 = rect.1.min(y);
-                rect.2 = rect.2.max(x);
-                rect.3 = rect.3.max(y);
-                rect.4 += 1;
-            })
-            .or_insert((x, y, x, y, 1));
+        if label >= rects.len() {
+            rects.resize_with(label + 1, || Component {
+                bbox: (u32::MAX, u32::MAX, 0, 0),
+                pixels: 0,
+            });
+        }
+        let rect = &mut rects[label];
+        // Store maxima in the width/height slots until all pixels are counted.
+        rect.bbox.0 = rect.bbox.0.min(x);
+        rect.bbox.1 = rect.bbox.1.min(y);
+        rect.bbox.2 = rect.bbox.2.max(x);
+        rect.bbox.3 = rect.bbox.3.max(y);
+        rect.pixels += 1;
     }
-
+    rects.retain(|c| c.pixels != 0);
+    for component in &mut rects {
+        component.bbox.2 = component.bbox.2 - component.bbox.0 + 1;
+        component.bbox.3 = component.bbox.3 - component.bbox.1 + 1;
+    }
     rects
-        .into_values()
-        .map(|(min_x, min_y, max_x, max_y, pixels)| Component {
-            bbox: (min_x, min_y, max_x - min_x + 1, max_y - min_y + 1),
-            pixels,
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -615,7 +610,7 @@ mod tests {
 /// Dev tool, not a test of invariants: run the CV detector over a real
 /// screenshot and print every candidate box, to study behaviour on actual UIs:
 ///   grim -t ppm /tmp/shot.ppm
-///   STOCHOS_CV_IMAGE=/tmp/shot.ppm cargo test --release -- --ignored --nocapture cv_boxes
+///   STOCHOS_CV_IMAGE=/tmp/shot.ppm STOCHOS_CV_RUNS=15 cargo test --release -- --ignored --nocapture cv_boxes
 #[cfg(test)]
 mod probe {
     use super::*;
@@ -664,12 +659,22 @@ mod probe {
         );
         crate::config::init();
         let (bgra, w, h) = read_ppm(&path);
-        let start = std::time::Instant::now();
-        let candidates = detect_candidates_cv(&bgra, w, h).expect("cv detection");
+        let runs = std::env::var("STOCHOS_CV_RUNS")
+            .map(|value| value.parse::<usize>().expect("positive STOCHOS_CV_RUNS"))
+            .unwrap_or(1);
+        assert!(runs > 0, "STOCHOS_CV_RUNS must be positive");
+        let mut timings = Vec::with_capacity(runs);
+        let mut candidates = Vec::new();
+        for _ in 0..runs {
+            let start = std::time::Instant::now();
+            candidates = detect_candidates_cv(&bgra, w, h).expect("cv detection");
+            timings.push(start.elapsed());
+        }
+        timings.sort_unstable();
         eprintln!(
-            "cv: {} candidates in {:?} on {w}x{h}",
+            "cv: {} candidates, median {:?} ({runs} runs) on {w}x{h}",
             candidates.len(),
-            start.elapsed()
+            timings[runs / 2]
         );
         let mut sorted = candidates;
         sorted.sort_by_key(|c| (c.bbox.1, c.bbox.0));

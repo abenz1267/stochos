@@ -95,10 +95,12 @@ fn detect_candidates_with_config(
     // so lowering its thresholds does not label every glyph or separator.
     let faint_edges = canny(
         &gray,
-        cfg.edge_low_threshold as f32 / 16.0,
-        cfg.edge_high_threshold as f32 / 16.0,
+        cfg.edge_low_threshold as f32 / 32.0,
+        cfg.edge_high_threshold as f32 / 32.0,
     );
-    let faint_closed = close(&faint_edges, Norm::LInf, CLOSE_RADIUS);
+    // A larger radius bridges placeholder glyphs to short field borders and
+    // merges fields near toolbar edges (especially after downscaling).
+    let faint_closed = close(&faint_edges, Norm::LInf, 1);
     let mut components = connected_component_boxes(&closed);
     components.extend(
         connected_component_boxes(&faint_closed)
@@ -107,6 +109,22 @@ fn detect_candidates_with_config(
             .filter(|c| !components.iter().any(|existing| existing.bbox == c.bbox))
             .collect::<Vec<_>>(),
     );
+
+    // Closing can join a field's border to adjacent toolbar/panel edges. Its
+    // foreground component then describes the whole panel, not the field.
+    // The enclosed background still describes the field's interior.
+    for field in enclosed_field_boxes(&faint_closed) {
+        if !components.iter().any(|existing| {
+            let a = existing.bbox;
+            let b = field.bbox;
+            a.0.abs_diff(b.0) <= 3
+                && a.1.abs_diff(b.1) <= 3
+                && a.2.abs_diff(b.2) <= 6
+                && a.3.abs_diff(b.3) <= 6
+        }) {
+            components.push(field);
+        }
+    }
 
     // Shape filters, relative to the working image so behaviour matches at
     // 1080p and 4K: minimum side (sub-glyph noise), maximum side/area
@@ -166,6 +184,34 @@ fn detect_candidates_with_config(
             }
         })
         .collect())
+}
+
+/// Find enclosed interiors independently of connected foreground borders.
+/// Keep only mostly empty, field-shaped regions surrounded on all four sides;
+/// screen edges and open outlines must not manufacture an enclosure.
+fn enclosed_field_boxes(mask: &GrayImage) -> Vec<Component> {
+    let inverse = GrayImage::from_fn(mask.width(), mask.height(), |x, y| {
+        Luma([if mask.get_pixel(x, y)[0] == 0 { 255 } else { 0 }])
+    });
+    // Foreground edges use eight neighbours; background must use four so a
+    // diagonal rounded corner stays closed rather than leaking outside.
+    component_boxes_with_connectivity(&inverse, Connectivity::Four)
+        .into_iter()
+        .filter_map(|mut component| {
+            let (x, y, w, h) = component.bbox;
+            if x == 0 || y == 0 || x + w >= mask.width() || y + h >= mask.height() {
+                return None;
+            }
+            if component.pixels as f32 / ((w * h) as f32) < 0.6 {
+                return None;
+            }
+            // Include the immediately surrounding edge, so the normal outline
+            // validator checks the enclosure rather than its empty interior.
+            component.bbox = (x - 1, y - 1, w + 2, h + 2);
+            field_outline_support(mask, component.bbox)?;
+            Some(component)
+        })
+        .collect()
 }
 
 /// Evidence for an outlined, horizontal field. Require most of every side;
@@ -290,7 +336,14 @@ fn grayscale_resized(bgra: &[u8], src_w: usize, src_h: usize, dst_w: u32, dst_h:
 /// Connected components of a binary mask, with occupied-pixel counts for the
 /// solidity score.
 fn connected_component_boxes(mask: &GrayImage) -> Vec<Component> {
-    let labels = connected_components(mask, Connectivity::Eight, Luma([0u8]));
+    component_boxes_with_connectivity(mask, Connectivity::Eight)
+}
+
+fn component_boxes_with_connectivity(
+    mask: &GrayImage,
+    connectivity: Connectivity,
+) -> Vec<Component> {
+    let labels = connected_components(mask, connectivity, Luma([0u8]));
     // (min_x, min_y, max_x, max_y, pixel_count)
     let mut rects: HashMap<u32, (u32, u32, u32, u32, u32)> = HashMap::new();
 
@@ -377,6 +430,74 @@ mod tests {
                 "missing {expected:?} on background {background}: {candidates:?}"
             );
         }
+    }
+
+    #[test]
+    fn detects_inputs_connected_to_panel_edges() {
+        for (background, field) in [(26, 34), (245, 237), (26, 31)] {
+            let mut img = GrayImage::from_pixel(640, 360, Luma([background]));
+            // Filled composer with a bottom border shared with a panel rule.
+            // The foreground component spans the screen and is not field-shaped.
+            for y in 280..308 {
+                for x in 100..580 {
+                    img.put_pixel(x, y, Luma([field]));
+                }
+            }
+            for x in 0..640 {
+                img.put_pixel(x, 308, Luma([field]));
+            }
+            // Text and action icons leave the interior mostly connected.
+            for x in (112..200).step_by(8) {
+                for y in 290..298 {
+                    img.put_pixel(x, y, Luma([128]));
+                }
+            }
+            let candidates = detect_gray(&img, &HintConfig::default());
+            assert!(
+                candidates.iter().any(|c| {
+                    c.bbox.0.abs_diff(100) <= 3
+                        && c.bbox.1.abs_diff(280) <= 3
+                        && c.bbox.2.abs_diff(480) <= 6
+                        && c.bbox.3.abs_diff(28) <= 6
+                }),
+                "missing connected composer on {background}: {candidates:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn enclosed_fields_preserve_diagonal_corners_and_reject_open_regions() {
+        let mut mask = GrayImage::new(640, 360);
+        // Diamond corners: eight-connected foreground encloses four-connected
+        // background, as on rounded fields after Canny and downscaling.
+        for x in 44..516 {
+            mask.put_pixel(x, 100, Luma([255]));
+            mask.put_pixel(x, 124, Luma([255]));
+        }
+        for y in 104..121 {
+            mask.put_pixel(40, y, Luma([255]));
+            mask.put_pixel(519, y, Luma([255]));
+        }
+        for d in 0..4 {
+            for (x, y) in [
+                (40 + d, 104 - d),
+                (519 - d, 104 - d),
+                (40 + d, 120 + d),
+                (519 - d, 120 + d),
+            ] {
+                mask.put_pixel(x, y, Luma([255]));
+            }
+        }
+        // Join the outline to a panel border; the interior must still survive.
+        for x in 0..44 {
+            mask.put_pixel(x, 100, Luma([255]));
+        }
+        let fields = enclosed_field_boxes(&mask);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].bbox, (40, 100, 480, 25));
+        // A real gap must leak outside, unlike a diagonal corner.
+        mask.put_pixel(40, 112, Luma([0]));
+        assert!(enclosed_field_boxes(&mask).is_empty());
     }
 
     #[test]

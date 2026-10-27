@@ -558,7 +558,7 @@ impl<'a> Canvas<'a> {
             let row_start = ((y + dy) * self.w + x) as usize * 4;
             let row_end = row_start + w as usize * 4;
             if row_end <= self.buf.len() {
-                for px in self.buf[row_start..row_end].chunks_exact_mut(4) {
+                for px in self.buf[row_start..row_end].as_chunks_mut::<4>().0 {
                     px.copy_from_slice(&color);
                 }
             }

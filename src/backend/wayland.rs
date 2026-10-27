@@ -1117,7 +1117,12 @@ fn convert_screencopy_buffer(
         let src = &data[y * stride..y * stride + row_bytes];
         let dst = &mut out[dst_y * row_bytes..(dst_y + 1) * row_bytes];
         if swap_rb {
-            for (src_px, dst_px) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+            for (src_px, dst_px) in src
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(dst.as_chunks_mut::<4>().0)
+            {
                 dst_px[0] = src_px[2];
                 dst_px[1] = src_px[1];
                 dst_px[2] = src_px[0];
@@ -1126,7 +1131,7 @@ fn convert_screencopy_buffer(
         } else {
             dst.copy_from_slice(src);
             if opaque {
-                for px in dst.chunks_exact_mut(4) {
+                for px in dst.as_chunks_mut::<4>().0 {
                     px[3] = 0xFF;
                 }
             }

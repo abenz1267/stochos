@@ -5,13 +5,13 @@
 //! structure, not semantic clickability.
 
 use anyhow::{bail, Context};
-use image::{GrayImage, Luma};
-use imageproc::{
-    distance_transform::Norm,
-    morphology::close,
-    region_labelling::{connected_components, Connectivity},
-};
+use image::GrayImage;
+#[cfg(test)]
+use image::Luma;
+use imageproc::region_labelling::Connectivity;
 mod edges;
+mod regions;
+use regions::{close_binary, component_boxes};
 
 use super::detect::{DetectorOutput, HintCandidate, HintDetector};
 use crate::{
@@ -87,14 +87,14 @@ fn detect_candidates_with_config(
     // Closing (dilate + erode) reconnects the broken strokes of one element
     // without inflating boxes or bridging neighbours.
     const CLOSE_RADIUS: u8 = 2;
-    let closed = close(&edges, Norm::LInf, CLOSE_RADIUS);
+    let closed = close_binary(&edges, CLOSE_RADIUS as usize);
 
     // Faint input borders often have no edge strong enough to seed the normal
     // Canny pass. Restrict this sensitive pass to field outlines and small,
     // compact icons so it does not label every faint glyph or separator.
     // A larger radius bridges placeholder glyphs to short field borders and
     // merges fields near toolbar edges (especially after downscaling).
-    let faint_closed = close(&faint_edges, Norm::LInf, 1);
+    let faint_closed = close_binary(&faint_edges, 1);
     let mut components = connected_component_boxes(&closed);
     components.extend(
         connected_component_boxes(&faint_closed)
@@ -199,12 +199,9 @@ fn is_compact_icon(component: &Component) -> bool {
 /// Keep only mostly empty, field-shaped regions surrounded on all four sides;
 /// screen edges and open outlines must not manufacture an enclosure.
 fn enclosed_field_boxes(mask: &GrayImage) -> Vec<Component> {
-    let inverse = GrayImage::from_fn(mask.width(), mask.height(), |x, y| {
-        Luma([if mask.get_pixel(x, y)[0] == 0 { 255 } else { 0 }])
-    });
     // Foreground edges use eight neighbours; background must use four so a
     // diagonal rounded corner stays closed rather than leaking outside.
-    component_boxes_with_connectivity(&inverse, Connectivity::Four)
+    component_boxes(mask, Connectivity::Four, true)
         .into_iter()
         .filter_map(|mut component| {
             let (x, y, w, h) = component.bbox;
@@ -345,42 +342,7 @@ fn grayscale_resized(bgra: &[u8], src_w: usize, src_h: usize, dst_w: u32, dst_h:
 /// Connected components of a binary mask, with occupied-pixel counts for the
 /// solidity score.
 fn connected_component_boxes(mask: &GrayImage) -> Vec<Component> {
-    component_boxes_with_connectivity(mask, Connectivity::Eight)
-}
-
-fn component_boxes_with_connectivity(
-    mask: &GrayImage,
-    connectivity: Connectivity,
-) -> Vec<Component> {
-    let labels = connected_components(mask, connectivity, Luma([0u8]));
-    // imageproc assigns dense labels starting at one. Indexing these directly
-    // avoids hashing every foreground pixel, including large empty interiors.
-    let mut rects: Vec<Component> = Vec::new();
-    for (x, y, label) in labels.enumerate_pixels() {
-        let label = label[0] as usize;
-        if label == 0 {
-            continue;
-        }
-        if label >= rects.len() {
-            rects.resize_with(label + 1, || Component {
-                bbox: (u32::MAX, u32::MAX, 0, 0),
-                pixels: 0,
-            });
-        }
-        let rect = &mut rects[label];
-        // Store maxima in the width/height slots until all pixels are counted.
-        rect.bbox.0 = rect.bbox.0.min(x);
-        rect.bbox.1 = rect.bbox.1.min(y);
-        rect.bbox.2 = rect.bbox.2.max(x);
-        rect.bbox.3 = rect.bbox.3.max(y);
-        rect.pixels += 1;
-    }
-    rects.retain(|c| c.pixels != 0);
-    for component in &mut rects {
-        component.bbox.2 = component.bbox.2 - component.bbox.0 + 1;
-        component.bbox.3 = component.bbox.3 - component.bbox.1 + 1;
-    }
-    rects
+    component_boxes(mask, Connectivity::Eight, false)
 }
 
 #[cfg(test)]

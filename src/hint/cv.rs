@@ -91,8 +91,8 @@ fn detect_candidates_with_config(
     let closed = close(&edges, Norm::LInf, CLOSE_RADIUS);
 
     // Faint input borders often have no edge strong enough to seed the normal
-    // Canny pass. Only accept field-shaped outlines from this sensitive pass,
-    // so lowering its thresholds does not label every glyph or separator.
+    // Canny pass. Restrict this sensitive pass to field outlines and small,
+    // compact icons so it does not label every faint glyph or separator.
     let faint_edges = canny(
         &gray,
         cfg.edge_low_threshold as f32 / 32.0,
@@ -105,7 +105,9 @@ fn detect_candidates_with_config(
     components.extend(
         connected_component_boxes(&faint_closed)
             .into_iter()
-            .filter(|c| field_outline_support(&faint_closed, c.bbox).is_some())
+            .filter(|c| {
+                field_outline_support(&faint_closed, c.bbox).is_some() || is_compact_icon(c)
+            })
             .filter(|c| !components.iter().any(|existing| existing.bbox == c.bbox))
             .collect::<Vec<_>>(),
     );
@@ -184,6 +186,19 @@ fn detect_candidates_with_config(
             }
         })
         .collect())
+}
+
+/// Recover small muted icons from the sensitive pass. At working resolution,
+/// individual text strokes are usually narrower than eight pixels; elongated
+/// text groups and sparse edge fragments must not qualify as compact icons.
+fn is_compact_icon(component: &Component) -> bool {
+    let (_, _, w, h) = component.bbox;
+    let short = w.min(h);
+    let long = w.max(h);
+    (8..=32).contains(&short)
+        && long <= 32
+        && long * 2 <= short * 3
+        && component.pixels as f32 / (w * h) as f32 >= 0.55
 }
 
 /// Find enclosed interiors independently of connected foreground borders.
@@ -498,6 +513,38 @@ mod tests {
         // A real gap must leak outside, unlike a diagonal corner.
         mask.put_pixel(40, 112, Luma([0]));
         assert!(enclosed_field_boxes(&mask).is_empty());
+    }
+
+    #[test]
+    fn detects_muted_tab_icons_after_downscaling() {
+        for (background, stroke, factor) in [(38, 80, 1), (38, 80, 2), (240, 198, 1)] {
+            let mut img = GrayImage::from_pixel(1280 * factor, 720 * factor, Luma([background]));
+            // A small ring with an internal handset-like stroke. Its contrast
+            // cannot seed the normal Canny pass, as with muted tab favicons.
+            for y in 0..11 * factor {
+                for x in 0..11 * factor {
+                    let dx = x as f32 / factor as f32 - 5.0;
+                    let dy = y as f32 / factor as f32 - 5.0;
+                    let r = dx * dx + dy * dy;
+                    let ring = (12.0..=25.0).contains(&r);
+                    let handset = (-2.0..=-1.0).contains(&dx) && (-2.0..=1.0).contains(&dy)
+                        || (-1.0..=2.0).contains(&dx) && (1.0..=2.0).contains(&dy);
+                    if ring || handset {
+                        img.put_pixel(200 * factor + x, 20 * factor + y, Luma([stroke]));
+                    }
+                }
+            }
+            let candidates = detect_gray(&img, &HintConfig::default());
+            assert!(
+                candidates.iter().any(|c| {
+                    c.bbox.0.abs_diff(200 * factor) <= 2 * factor
+                        && c.bbox.1.abs_diff(20 * factor) <= 2 * factor
+                        && c.bbox.2.abs_diff(11 * factor) <= 4 * factor
+                        && c.bbox.3.abs_diff(11 * factor) <= 4 * factor
+                }),
+                "missing muted icon at scale {factor} on {background}: {candidates:?}"
+            );
+        }
     }
 
     #[test]
